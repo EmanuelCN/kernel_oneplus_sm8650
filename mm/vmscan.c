@@ -63,7 +63,6 @@
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
 #include <linux/sched/sysctl.h>
-#include <linux/simple_lmk.h>
 
 #include "internal.h"
 #include "swap.h"
@@ -6728,8 +6727,6 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	trace_android_vh_shrink_node(pgdat, sc->target_mem_cgroup);
 	if (lru_gen_enabled() && global_reclaim(sc)) {
 		lru_gen_shrink_node(pgdat, sc);
-		if (sc->priority < DEF_PRIORITY / 2)
-			simple_lmk_reclaim_needed();
 		return;
 	}
 
@@ -6755,9 +6752,6 @@ again:
 		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
 			   sc->nr_scanned - nr_scanned,
 			   sc->nr_reclaimed - nr_reclaimed, sc->order);
-
-	if (sc->priority < DEF_PRIORITY / 2)
-		simple_lmk_reclaim_needed();
 
 	if (sc->nr_reclaimed - nr_reclaimed)
 		reclaimable = true;
