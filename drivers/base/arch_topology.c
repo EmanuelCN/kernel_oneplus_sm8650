@@ -49,11 +49,6 @@ bool topology_scale_freq_invariant(void)
 	       supports_scale_freq_counters(cpu_online_mask);
 }
 
-bool topology_scale_freq_counters_active(void)
-{
-	return !cpumask_empty(&scale_freq_counters_mask);
-}
-
 static void update_scale_freq_invariant(bool status)
 {
 	if (scale_freq_invariant == status)
