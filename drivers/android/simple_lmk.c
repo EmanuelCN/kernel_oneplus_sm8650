@@ -6,29 +6,17 @@
 #define pr_fmt(fmt) "simple_lmk: " fmt
 
 #include <linux/freezer.h>
-#include <linux/jiffies.h>
 #include <linux/kthread.h>
-#include <linux/minmax.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
 #include <linux/sort.h>
+#include <linux/vmpressure.h>
 #include <uapi/linux/sched/types.h>
-#include <linux/cpu_boost.h>
-#include <soc/qcom/dcvs_boost.h>
 
 /* The minimum number of pages to free per reclaim */
 #define MIN_FREE_PAGES (CONFIG_ANDROID_SIMPLE_LMK_MINFREE * SZ_1M / PAGE_SIZE)
-
-/* Upper bound for a single adaptive reclaim so one burst is covered at once */
-#define MAX_FREE_PAGES ((512UL * SZ_1M) / PAGE_SIZE)
-
-/* Quiet period between order-0 reclaim passes; bypassed when critical */
-#define RECLAIM_COOLDOWN msecs_to_jiffies(CONFIG_ANDROID_SIMPLE_LMK_COOLDOWN_MSEC)
-
-/* Normal passes only target cached/empty tiers; lower adjs are last resort */
-#define PROTECT_ADJ 100
 
 /* Kill up to this many victims per reclaim */
 #define MAX_VICTIMS 1024
@@ -53,12 +41,6 @@ static bool reclaim_active;
 static atomic_t needs_reclaim = ATOMIC_INIT(0);
 static atomic_t needs_reap = ATOMIC_INIT(0);
 static atomic_t nr_killed = ATOMIC_INIT(0);
-/* Lockless hints latched from the reclaim path for the killer thread */
-static atomic_t hint_order = ATOMIC_INIT(0);
-static atomic_t hint_direct = ATOMIC_INIT(0);
-static unsigned long last_kill_jiffies;
-static int suppressed_streak;
-static int episode_kills;
 
 static int victim_cmp(const void *lhs_ptr, const void *rhs_ptr)
 {
@@ -87,45 +69,7 @@ static unsigned long get_total_mm_pages(struct mm_struct *mm)
 	return pages;
 }
 
-/* 12.5% of RAM still free means the burst already recovered */
-static bool mem_low(long avail, unsigned long total)
-{
-	if (avail < 0)
-		return true;
-
-	return avail < (long)(total >> 3);
-}
-
-/* 6.25% left is dire enough to ignore the cooldown entirely */
-static bool mem_critical(long avail, unsigned long total)
-{
-	if (avail < 0)
-		return true;
-
-	return avail < (long)(total >> 4);
-}
-
-/* Aim one pass at refilling back up to the low threshold */
-static unsigned long kill_target(long avail, unsigned long total)
-{
-	unsigned long low = total >> 3;
-	unsigned long max_batch = max_t(unsigned long, MIN_FREE_PAGES,
-					MAX_FREE_PAGES);
-	unsigned long shortfall;
-
-	if (avail < 0)
-		return MIN_FREE_PAGES;
-
-	if ((unsigned long)avail >= low)
-		return MIN_FREE_PAGES;
-
-	shortfall = low - (unsigned long)avail;
-
-	return clamp_t(unsigned long, shortfall, MIN_FREE_PAGES, max_batch);
-}
-
-static unsigned long find_victims(int *vindex, unsigned long target_pages,
-				  short min_adj_floor)
+static unsigned long find_victims(int *vindex)
 {
 	short i, min_adj = SHRT_MAX, max_adj = 0;
 	unsigned long pages_found = 0;
@@ -137,16 +81,16 @@ static unsigned long find_victims(int *vindex, unsigned long target_pages,
 		short adj;
 
 		/*
-		 * Search for suitable tasks at or above the floor adj.
-		 * The protected tier (adj >= 100) naturally excludes the
-		 * foreground app and kthreads; escalation to 0 is last resort.
-		 * Although oom_score_adj can still be changed
+		 * Search for suitable tasks with a positive adj (importance).
+		 * Since only tasks with a positive adj can be targeted, that
+		 * naturally excludes tasks which shouldn't be killed, like init
+		 * and kthreads. Although oom_score_adj can still be changed
 		 * while this code runs, it doesn't really matter; we just need
 		 * a snapshot of the task's adj.
 		 */
 		sig = tsk->signal;
 		adj = READ_ONCE(sig->oom_score_adj);
-		if (adj < min_adj_floor || sig->flags & SIGNAL_GROUP_EXIT ||
+		if (adj < 0 || sig->flags & SIGNAL_GROUP_EXIT ||
 		    (thread_group_empty(tsk) && tsk->flags & PF_EXITING))
 			continue;
 
@@ -206,7 +150,7 @@ static unsigned long find_victims(int *vindex, unsigned long target_pages,
 		     sizeof(*victims), victim_cmp, victim_swap);
 
 		/* Stop when we are out of space or have enough pages found */
-		if (*vindex == MAX_VICTIMS || pages_found >= target_pages) {
+		if (*vindex == MAX_VICTIMS || pages_found >= MIN_FREE_PAGES) {
 			/* Zero out any remaining buckets we didn't touch */
 			if (i > min_adj)
 				memset(&task_bucket[min_adj], 0,
@@ -219,7 +163,7 @@ static unsigned long find_victims(int *vindex, unsigned long target_pages,
 	return pages_found;
 }
 
-static int process_victims(int vlen, unsigned long target_pages)
+static int process_victims(int vlen)
 {
 	unsigned long pages_found = 0;
 	int i, nr_to_kill = 0;
@@ -233,7 +177,7 @@ static int process_victims(int vlen, unsigned long target_pages)
 		struct task_struct *vtsk = victim->tsk;
 
 		/* The victim's mm lock is taken in find_victims; release it */
-		if (pages_found >= target_pages) {
+		if (pages_found >= MIN_FREE_PAGES) {
 			task_unlock(vtsk);
 		} else {
 			pages_found += victim->size;
@@ -253,9 +197,10 @@ static void set_task_rt_prio(struct task_struct *tsk, int priority)
 	sched_setscheduler_nocheck(tsk, SCHED_RR, &rt_prio);
 }
 
-static void scan_and_kill(unsigned long target_pages, short min_adj_floor)
+static void scan_and_kill(void)
 {
 	int i, nr_to_kill, nr_found = 0;
+	unsigned long pages_found;
 
 	/*
 	 * Reset nr_victims so the reaper thread and simple_lmk_mm_freed() are
@@ -266,20 +211,32 @@ static void scan_and_kill(unsigned long target_pages, short min_adj_floor)
 	write_unlock(&mm_free_lock);
 
 	/* Populate the victims array with tasks sorted by adj and then size */
-	find_victims(&nr_found, target_pages, min_adj_floor);
+	pages_found = find_victims(&nr_found);
 	if (unlikely(!nr_found)) {
 		pr_err_ratelimited("No processes available to kill!\n");
 		return;
 	}
 
-	qcom_dcvs_bus_boost_kick_max(100);
-	cpu_boost_max(100);
-	/*
-	 * Keep strict adj ordering: kill the prefix needed to cover the
-	 * target. No cross-adj size substitution, so a large low-adj
-	 * victim can't displace several small high-adj ones.
-	 */
-	nr_to_kill = process_victims(nr_found, target_pages);
+	/* Minimize the number of victims if we found more pages than needed */
+	if (pages_found > MIN_FREE_PAGES) {
+		/* First round of processing to weed out unneeded victims */
+		nr_to_kill = process_victims(nr_found);
+
+		/*
+		 * Try to kill as few of the chosen victims as possible by
+		 * sorting the chosen victims by size, which means larger
+		 * victims that have a lower adj can be killed in place of
+		 * smaller victims with a high adj.
+		 */
+		sort(victims, nr_to_kill, sizeof(*victims), victim_cmp,
+		     victim_swap);
+
+		/* Second round of processing to finally select the victims */
+		nr_to_kill = process_victims(nr_to_kill);
+	} else {
+		/* Too few pages found, so all the victims need to be killed */
+		nr_to_kill = nr_found;
+	}
 
 	/*
 	 * Store the final number of victims for simple_lmk_mm_freed() and the
@@ -318,13 +275,13 @@ static void scan_and_kill(unsigned long target_pages, short min_adj_floor)
 			set_tsk_thread_flag(t, TIF_MEMDIE);
 		for_each_thread(vtsk, t)
 			set_task_rt_prio(t, 1);
-		/* Signals can't wake frozen tasks; only a thaw operation can */
-		for_each_thread(vtsk, t)
-			__thaw_task(t);
 		rcu_read_unlock();
 
 		/* Allow the victim to run on any CPU. This won't schedule. */
 		set_cpus_allowed_ptr(vtsk, cpu_all_mask);
+
+		/* Signals can't wake frozen tasks; only a thaw operation can */
+		__thaw_task(vtsk);
 
 		/* Store the number of anon pages to sort victims for reaping */
 		victim->size = get_mm_counter(mm, MM_ANONPAGES);
@@ -365,62 +322,9 @@ static int simple_lmk_reclaim_thread(void *data)
 	set_freezable();
 
 	while (1) {
-		int order;
-		bool direct, in_cooldown, critical;
-		long avail;
-		unsigned long total, target;
-		short floor;
-
 		wait_event_freezable(oom_waitq, atomic_read(&needs_reclaim));
-		/* Clear before killing so triggers during the kill latch next pass */
+		scan_and_kill();
 		atomic_set(&needs_reclaim, 0);
-		order = atomic_xchg(&hint_order, 0);
-		direct = atomic_xchg(&hint_direct, 0);
-
-		/* Single snapshot so gating, target and tier agree */
-		avail = si_mem_available();
-		total = totalram_pages();
-
-		/* Stale trigger: victims from the last pass already recovered us */
-		if (!mem_low(avail, total)) {
-			suppressed_streak = 0;
-			episode_kills = 0;
-			continue;
-		}
-
-		critical = mem_critical(avail, total);
-		in_cooldown = CONFIG_ANDROID_SIMPLE_LMK_COOLDOWN_MSEC > 0 &&
-			      last_kill_jiffies &&
-			      time_before(jiffies,
-					  last_kill_jiffies + RECLAIM_COOLDOWN);
-
-		/*
-		 * Cooldown only throttles order-0: a high-order allocation
-		 * failing means compaction/fragmentation pressure that file
-		 * reclaim won't relieve by waiting, so it bypasses.
-		 * Critically low memory bypasses too, so a true OOM is
-		 * never delayed by the cooldown.
-		 *
-		 * Direct stalls get less grace than kswapd background;
-		 * sustained pressure forces a kill below.
-		 */
-		if (in_cooldown && order == 0 && !critical &&
-		    ++suppressed_streak < (direct ? 2 : 3))
-			continue;
-		suppressed_streak = 0;
-
-		target = kill_target(avail, total);
-		floor = PROTECT_ADJ;
-		if (critical || order > PAGE_ALLOC_COSTLY_ORDER || episode_kills) {
-			pr_info_ratelimited("escalating below adj %d (critical=%d order=%d streak=%d)\n",
-					    PROTECT_ADJ, critical, order,
-					    episode_kills);
-			floor = 0;
-		}
-
-		scan_and_kill(target, floor);
-		last_kill_jiffies = jiffies;
-		episode_kills++;
 	}
 
 	return 0;
@@ -543,23 +447,23 @@ void simple_lmk_mm_freed(struct mm_struct *mm)
 	read_unlock(&mm_free_lock);
 }
 
-void simple_lmk_reclaim_needed(int order, bool direct)
+static int simple_lmk_vmpressure_cb(struct notifier_block *nb,
+				    unsigned long pressure, void *data)
 {
-	int cur;
+	if (pressure == 100) {
+		atomic_set(&needs_reclaim, 1);
+		smp_mb__after_atomic();
+		if (waitqueue_active(&oom_waitq))
+			wake_up(&oom_waitq);
+	}
 
-	atomic_set(&needs_reclaim, 1);
-	/* Latch the largest order seen; high-order bypasses the cooldown */
-	cur = atomic_read(&hint_order);
-	while (order > cur &&
-	       !atomic_try_cmpxchg(&hint_order, &cur, order))
-		;
-	if (direct)
-		atomic_set(&hint_direct, 1);
-	smp_mb__after_atomic();
-	if (waitqueue_active(&oom_waitq))
-		wake_up(&oom_waitq);
+	return NOTIFY_OK;
 }
-EXPORT_SYMBOL_GPL(simple_lmk_reclaim_needed);
+
+static struct notifier_block vmpressure_notif = {
+	.notifier_call = simple_lmk_vmpressure_cb,
+	.priority = INT_MAX
+};
 
 /* Initialize Simple LMK when lmkd in Android writes to the minfree parameter */
 static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
@@ -574,6 +478,7 @@ static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
 		thread = kthread_run(simple_lmk_reclaim_thread, NULL,
 				     "simple_lmkd");
 		BUG_ON(IS_ERR(thread));
+		BUG_ON(vmpressure_notifier_register(&vmpressure_notif));
 	}
 
 	return 0;
