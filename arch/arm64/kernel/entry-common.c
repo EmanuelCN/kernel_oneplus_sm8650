@@ -132,12 +132,13 @@ static __always_inline void __exit_to_user_mode(void)
 static __always_inline void prepare_exit_to_user_mode(struct pt_regs *regs)
 {
 	unsigned long flags;
-	int thread_lazy_flag = test_thread_flag(TIF_LAZY_RESCHED);
+	int thread_lazy_flag = 0;
 
 	local_daif_mask();
 
 	flags = read_thread_flags();
 
+	trace_android_vh_restore_curr_resched(&flags, &thread_lazy_flag);
 	if (unlikely(flags & _TIF_WORK_MASK) || thread_lazy_flag)
 		do_notify_resume(regs, flags);
 }

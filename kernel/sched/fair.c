@@ -60,9 +60,6 @@
 #include <trace/hooks/sched.h>
 #include <trace/hooks/dtask.h>
 
-#include <linux/cpu_boost.h>
-#include <linux/sched_task_critical.h>
-
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
 
 /*
@@ -9114,16 +9111,6 @@ update:
 	return;
 
 preempt:
-	{
-		bool skip = sched_task_critical(rq->curr) && !sched_task_critical(p) &&
-			    !cpu_boost_active(cpu_of(rq));
-
-		trace_android_vh_resched_curr_lazy(rq_of(cfs_rq), &skip);
-		if (skip) {
-			set_tsk_lazy_resched(rq->curr);
-			return;
-		}
-	}
 	cancel_protect_slice(se);
 
 	if (preempt_action == PREEMPT_WAKEUP_SHORT)

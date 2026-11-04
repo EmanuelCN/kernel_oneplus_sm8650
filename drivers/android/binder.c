@@ -49,7 +49,6 @@
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
-#include <linux/sched_task_critical.h>
 #include <linux/mutex.h>
 #include <linux/nsproxy.h>
 #include <linux/poll.h>
@@ -87,9 +86,17 @@
 
 extern int kp_active_mode(void);
 
+#define CRITICAL_OOM_SCORE_ADJ	(-900)
+
 static __always_inline bool task_is_critical(void)
 {
-	return sched_task_critical(current);
+	if (current->flags & PF_KTHREAD)
+		return false;
+
+	if (unlikely(!current->signal))
+		return false;
+
+	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
 }
 
 static HLIST_HEAD(binder_deferred_list);

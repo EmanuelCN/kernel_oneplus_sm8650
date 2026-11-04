@@ -28,7 +28,6 @@
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
-#include <linux/sched_task_critical.h>
 #include <linux/init.h>
 #include <linux/signal.h>
 #include <linux/completion.h>
@@ -57,9 +56,17 @@
 
 #include <trace/hooks/wqlockup.h>
 
+#define CRITICAL_OOM_SCORE_ADJ	(-900)
+
 static __always_inline bool task_is_critical(void)
 {
-	return sched_task_critical(current);
+	if (current->flags & PF_KTHREAD)
+		return false;
+
+	if (unlikely(!current->signal))
+		return false;
+
+	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
 }
 
 /* events/workqueue.h uses default TRACE_INCLUDE_PATH */
