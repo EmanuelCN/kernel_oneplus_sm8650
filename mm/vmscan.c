@@ -8182,9 +8182,8 @@ void kswapd_run(int nid)
 	}
 	pgdat_kswapd_unlock(pgdat);
 
-	spin_lock_init(&pgdat->kcompress_fifo_lock);
 	ret = kfifo_alloc(&pgdat->kcompress_fifo,
-			KCOMPRESS_FIFO_SIZE * sizeof(struct page *),
+			KCOMPRESS_FIFO_SIZE * sizeof(struct folio *),
 			GFP_KERNEL);
 	if (ret) {
 		pr_err("%s: fail to kfifo_alloc\n", __func__);

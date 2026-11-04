@@ -177,38 +177,16 @@ bad_bmap:
 	goto out;
 }
 
-static void do_swapout(struct page *page)
+static bool swap_sched_async_compress(struct page *page)
 {
-	struct writeback_control wbc = {
-		.sync_mode = WB_SYNC_NONE,
-		.nr_to_write = SWAP_CLUSTER_MAX,
-		.range_start = 0,
-		.range_end = LLONG_MAX,
-		.for_reclaim = 1,
-	};
-
-	if (frontswap_store(page) == 0) {
-		folio_start_writeback(page_folio(page));
-		folio_unlock(page_folio(page));
-		folio_end_writeback(page_folio(page));
-	} else {
-		__swap_writepage(page, &wbc);
-	}
-
-	put_page(page);
-}
-
-static bool kcompressd_store(struct page *page)
-{
-	pg_data_t *pgdat = NODE_DATA(page_to_nid(page));
-	unsigned int ret, sysctl_kcompressd_val = vm_kcompressd;
-	struct page *head = NULL;
 	struct swap_info_struct *sis;
+	int nid = page_to_nid(page);
+	pg_data_t *pgdat = NODE_DATA(nid);
 
-	if (!current_is_kswapd())
+	if (unlikely(!pgdat->kcompressd))
 		return false;
 
-	if (!sysctl_kcompressd_val || unlikely(!pgdat->kcompressd))
+	if (!current_is_kswapd())
 		return false;
 
 	if (!PageAnon(page))
@@ -216,27 +194,14 @@ static bool kcompressd_store(struct page *page)
 
 	sis = page_swap_info(page);
 	if (data_race(sis->flags & SWP_SYNCHRONOUS_IO)) {
-		scoped_guard(spinlock_irqsave, &pgdat->kcompress_fifo_lock) {
-			if (kfifo_len(&pgdat->kcompress_fifo) >= sysctl_kcompressd_val * sizeof(page) &&
-					unlikely(!kfifo_out(&pgdat->kcompress_fifo, &head, sizeof(page))))
-				head = NULL;
+		if (kfifo_avail(&pgdat->kcompress_fifo) >= sizeof(page) &&
+			kfifo_in(&pgdat->kcompress_fifo, &page, sizeof(page))) {
+			wake_up_interruptible(&pgdat->kcompressd_wait);
+			return true;
 		}
 	}
 
-	get_page(page);
-
-	scoped_guard(spinlock_irqsave, &pgdat->kcompress_fifo_lock) {
-		ret = kfifo_in(&pgdat->kcompress_fifo, &page, sizeof(page));
-	}
-	if (likely(ret))
-		wake_up_interruptible(&pgdat->kcompressd_wait);
-	else
-		put_page(page);
-
-	if (head)
-		do_swapout(head);
-
-	return ret;
+	return false;
 }
 
 /*
@@ -263,9 +228,6 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		folio_unlock(folio);
 		goto out;
 	}
-	if (kcompressd_store(&folio->page))
-		return 0;
-
 	if (frontswap_store(&folio->page) == 0) {
 		folio_start_writeback(folio);
 		folio_unlock(folio);
@@ -278,6 +240,9 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	 * of both file and anon pages, try to do compression async
 	 * if possible
 	 */
+	if (swap_sched_async_compress(&folio->page))
+		return 0;
+
 	trace_android_vh_swap_writepage_start(&swap_writepage_start);
 	ret = __swap_writepage(&folio->page, wbc);
 	trace_android_vh_swap_writepage_end(&folio->page, wbc,
@@ -290,16 +255,23 @@ int kcompressd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct page *page;
-
-	current->flags |= PF_MEMALLOC | PF_KSWAPD;
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_NONE,
+		.nr_to_write = SWAP_CLUSTER_MAX,
+		.range_start = 0,
+		.range_end = LLONG_MAX,
+		.for_reclaim = 1,
+	};
 
 	while (!kthread_should_stop()) {
 		wait_event_interruptible(pgdat->kcompressd_wait,
 				!kfifo_is_empty(&pgdat->kcompress_fifo));
 
-		while (kfifo_out_locked(&pgdat->kcompress_fifo,
-				&page, sizeof(page), &pgdat->kcompress_fifo_lock))
-			do_swapout(page);
+		while (!kfifo_is_empty(&pgdat->kcompress_fifo)) {
+			if (kfifo_out(&pgdat->kcompress_fifo, &page, sizeof(page))) {
+				__swap_writepage(page, &wbc);
+			}
+		}
 	}
 	return 0;
 }
